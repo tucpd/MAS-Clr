@@ -1,0 +1,78 @@
+1.  FUNCTION Main()
+2.      INITIALIZE CameraAgent, PersonalizedAgent, ControlAgent
+3.      WHILE system is active
+4.          CALL ProcessCameraCommand()
+5.          CALL ProcessPersonalizedCommand()
+6.      ENDWHILE
+7.  ENDFUNCTION
+
+8.  FUNCTION ProcessCameraCommand()
+9.      SET command = CALL_CameraAgent_GenerateCommand()
+10.     CALL ControlAgent_ProcessCommand(command)
+11. ENDFUNCTION
+
+12. FUNCTION ProcessPersonalizedCommand()
+13.     SET command = CALL_PersonalizedAgent_GenerateCommand()
+14.     CALL ControlAgent_ProcessCommand(command)
+15. ENDFUNCTION
+
+16. FUNCTION ControlAgent_ProcessCommand(command)
+17.     IF NOT CALL_ControlAgent_CheckCommand(command)
+18.         LOG "Command check failed"
+19.         GOTO End
+20.     ENDIF
+21.     SET device_id = CALL_ControlAgent_FindIdDevice(command)
+22.     IF device_id IS_NULL
+23.         LOG "Device not found"
+24.         GOTO End
+25.     ENDIF
+26.     IF NOT CALL_ControlAgent_ExecuteCommand(command, device_id)
+27.         LOG "Command execution failed"
+28.         GOTO End
+29.     ENDIF
+30.     LOG "Command executed successfully"
+31. ENDFUNCTION
+
+32. FUNCTION ControlAgent_CheckCommand(command)
+33.     IF command IS_VALID
+34.         RETURN true
+35.     ELSE
+36.         RETURN false
+37.     ENDIF
+38. ENDFUNCTION
+
+39. FUNCTION ControlAgent_FindIdDevice(command)
+40.     SET device_id = QUERY_DEVICE_DATABASE(command)
+41.     IF device_id IS_FOUND
+42.         RETURN device_id
+43.     ELSE
+44.         RETURN null
+45.     ENDIF
+46. ENDFUNCTION
+
+47. FUNCTION ControlAgent_ExecuteCommand(command, device_id)
+48.     IF SEND_COMMAND_TO_DEVICE(command, device_id)
+49.         RETURN true
+50.     ELSE
+51.         RETURN false
+52.     ENDIF
+53. ENDFUNCTION
+
+54. LABEL End
+55.     LOG "Workflow completed or terminated"
+56. ENDFUNCTION
+
+// Control Agent Workflow (Steps)
+1. Initialize CameraAgent, PersonalizedAgent, ControlAgent
+2. While system is active:
+    a. Receive command from CameraAgent
+    b. Receive command from PersonalizedAgent
+    c. For each command:
+        i. Check command validity
+        ii. Find target device
+        iii. If valid and device found:
+            - Execute command
+            - Log success
+        iv. Else:
+            - Log error (invalid command or device not found)
+3. End workflow
