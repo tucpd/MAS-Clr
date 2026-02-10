@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Model weights and large artifacts
+*.pt
+*.onnx
+*.engine
+
+# Dataset artifacts (adjust if needed)
+*.zip
+
+# VS Code
+.vscode/
+paper/
+data/
+camera_agent/__pycache__/
+camera_agent/face_data/
+camera_agent/Short_Video_Action/
+camera_agent/camera agent data/
