@@ -5,6 +5,7 @@ numpy>=1.24.0
 torch>=2.0.0
 torchvision>=0.15.0
 ultralytics>=8.0.0
+timm>=0.9.0  # For efficient backbones in unified model
 
 # Face recognition 
 insightface>=0.7.3 
