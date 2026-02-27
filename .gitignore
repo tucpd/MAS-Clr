@@ -35,3 +35,4 @@ camera_agent/__pycache__/
 camera_agent/face_data/
 camera_agent/Short_Video_Action/
 camera_agent/camera agent data/
+.claude/
