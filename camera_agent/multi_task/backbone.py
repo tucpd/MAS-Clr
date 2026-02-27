@@ -56,12 +56,14 @@ class SharedBackbone(nn.Module):
                 out_indices=[2, 3, 4]
             )
         
-        # Get feature info to determine channels
-        feature_info = self.backbone.feature_info
-        self.backbone_channels = [info['num_chs'] for info in feature_info]
+        # Determine actual output channels via dummy forward
+        # (feature_info may list ALL stages, not just out_indices)
+        with torch.no_grad():
+            dummy = self.backbone(torch.zeros(1, 3, 64, 64))
+        self.backbone_channels = [f.shape[1] for f in dummy]
         
         print(f"Backbone: {backbone_name}")
-        print(f"Feature channels: {self.backbone_channels}")
+        print(f"Feature channels (out_indices=[2,3,4]): {self.backbone_channels}")
         
         # Feature Pyramid Network (FPN) for multi-scale features
         self.fpn = FeaturePyramidNetwork(

@@ -1,325 +1,309 @@
 """
-Task-specific detection heads for multi-task model
-PersonHead: Detect person bounding boxes
-FaceHead: Detect face bounding boxes + landmarks
-HandHead: Detect hand keypoints (21 landmarks)
+Task-specific detection heads for multi-task model (FCOS-style)
+
+Conventions:
+  - Classification: 1 channel, raw logit → sigmoid = probability
+  - Bbox regression: 4 channels (l, t, r, b) distances in pixels from grid center
+    Head applies exp(clamp(raw)) * learnable_scale → always positive
+  - Centerness: 1 channel, raw logit → sigmoid = center-ness score [0,1]
+  - Landmarks: N*2 channels, (dx, dy) offsets from grid center, normalized by stride
+  - Keypoints: N*2 channels, (dx, dy) offsets from grid center, normalized by stride
+
+Each head applies shared conv weights across multiple FPN levels (FCOS/RetinaNet style).
 """
 
 import torch
 import torch.nn as nn
-from typing import Dict, Tuple
+from typing import Dict, List, Tuple
 
+# FPN level strides (determined by backbone + FPN)
+STRIDES = {'p3': 8, 'p4': 16, 'p5': 32}
+
+
+class ConvSubnet(nn.Module):
+    """Shared convolutional subnet: N × (Conv3x3 + GroupNorm + ReLU)"""
+
+    def __init__(self, in_channels: int, out_channels: int, num_convs: int = 2):
+        super().__init__()
+        layers = []
+        for i in range(num_convs):
+            ch_in = in_channels if i == 0 else out_channels
+            layers.extend([
+                nn.Conv2d(ch_in, out_channels, 3, padding=1, bias=False),
+                nn.GroupNorm(32, out_channels),
+                nn.ReLU(inplace=True),
+            ])
+        self.net = nn.Sequential(*layers)
+        self._init_weights()
+
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.normal_(m.weight, std=0.01)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
+
+
+# ---------------------------------------------------------------------------
+# Person Head
+# ---------------------------------------------------------------------------
 
 class PersonHead(nn.Module):
     """
-    Detection head for person detection
-    Outputs: bounding boxes + confidence scores
+    FCOS-style person detection head — multi-scale (p3, p4, p5)
+
+    Outputs per FPN level:
+      person_cls  [B, 1, H, W]  classification logit
+      person_reg  [B, 4, H, W]  ltrb distances (pixels, positive)
+      person_ctr  [B, 1, H, W]  centerness logit
     """
-    
-    def __init__(self, in_channels: int = 256, num_classes: int = 1):
-        """
-        Args:
-            in_channels: Input feature channels from backbone
-            num_classes: Number of classes (1 for person only)
-        """
+
+    def __init__(
+        self,
+        in_channels: int = 256,
+        feat_levels: Tuple[str, ...] = ('p3', 'p4', 'p5'),
+    ):
         super().__init__()
-        
-        self.num_classes = num_classes
-        
-        # Detection layers
-        self.conv1 = nn.Sequential(
-            nn.Conv2d(in_channels, 256, 3, padding=1),
-            nn.BatchNorm2d(256),
-            nn.ReLU(inplace=True)
-        )
-        
-        self.conv2 = nn.Sequential(
-            nn.Conv2d(256, 256, 3, padding=1),
-            nn.BatchNorm2d(256),
-            nn.ReLU(inplace=True)
-        )
-        
-        # Classification head (objectness + class)
-        self.cls_head = nn.Conv2d(256, num_classes + 1, 1)  # +1 for objectness
-        
-        # Regression head (x, y, w, h)
-        self.reg_head = nn.Conv2d(256, 4, 1)
-        
-        # Initialize weights
-        self._init_weights()
-    
-    def _init_weights(self):
-        for m in self.modules():
-            if isinstance(m, nn.Conv2d):
-                nn.init.normal_(m.weight, std=0.01)
-                if m.bias is not None:
-                    nn.init.constant_(m.bias, 0)
-    
-    def forward(self, features: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
-        """
-        Args:
-            features: Multi-scale features from backbone {'p3', 'p4', 'p5'}
-            
-        Returns:
-            Dictionary containing:
-            - 'person_cls': Classification scores [B, num_classes+1, H, W]
-            - 'person_reg': Bounding box regression [B, 4, H, W]
-        """
-        # Use P4 features (1/16 resolution) for person detection
-        x = features['p4']
-        
-        # Apply detection layers
-        x = self.conv1(x)
-        x = self.conv2(x)
-        
-        # Classification and regression
-        cls_output = self.cls_head(x)
-        reg_output = self.reg_head(x)
-        
+        self.feat_levels = feat_levels
+
+        # Separate cls / reg subnets (FCOS convention)
+        self.cls_subnet = ConvSubnet(in_channels, 256, num_convs=2)
+        self.reg_subnet = ConvSubnet(in_channels, 256, num_convs=2)
+
+        # Output heads
+        self.cls_head = nn.Conv2d(256, 1, 3, padding=1)
+        self.reg_head = nn.Conv2d(256, 4, 3, padding=1)
+        self.ctr_head = nn.Conv2d(256, 1, 3, padding=1)
+
+        # Learnable scale per FPN level
+        self.scales = nn.ParameterDict({
+            lvl: nn.Parameter(torch.ones(1)) for lvl in feat_levels
+        })
+        self._init_heads()
+
+    def _init_heads(self):
+        for m in [self.cls_head, self.reg_head, self.ctr_head]:
+            nn.init.normal_(m.weight, std=0.01)
+            nn.init.constant_(m.bias, 0)
+        # Focal-loss prior: sigmoid(-4.6) ≈ 0.01
+        nn.init.constant_(self.cls_head.bias, -4.6)
+
+    def forward(
+        self, features: Dict[str, torch.Tensor]
+    ) -> Dict[str, List[torch.Tensor]]:
+        cls_out, reg_out, ctr_out = [], [], []
+        for lvl in self.feat_levels:
+            cls_feat = self.cls_subnet(features[lvl])
+            reg_feat = self.reg_subnet(features[lvl])
+
+            cls_out.append(self.cls_head(cls_feat))
+            reg_out.append(
+                torch.exp(self.reg_head(reg_feat).clamp(max=8.0))
+                * self.scales[lvl]
+            )
+            ctr_out.append(self.ctr_head(cls_feat))
+
         return {
-            'person_cls': cls_output,
-            'person_reg': reg_output
+            'person_cls': cls_out,
+            'person_reg': reg_out,
+            'person_ctr': ctr_out,
         }
 
+
+# ---------------------------------------------------------------------------
+# Face Head
+# ---------------------------------------------------------------------------
 
 class FaceHead(nn.Module):
     """
-    Detection head for face detection with landmarks
-    Outputs: bounding boxes + 5 facial landmarks (eyes, nose, mouth corners)
+    FCOS-style face detection + landmark head — multi-scale (p3, p4)
+
+    Outputs per FPN level:
+      face_cls  [B, 1, H, W]   classification logit
+      face_reg  [B, 4, H, W]   ltrb distances (pixels)
+      face_ctr  [B, 1, H, W]   centerness logit
+      face_lmk  [B, 10, H, W]  5 landmarks × (dx, dy) offsets / stride
     """
-    
-    def __init__(self, in_channels: int = 256, num_landmarks: int = 5):
-        """
-        Args:
-            in_channels: Input feature channels from backbone
-            num_landmarks: Number of facial landmarks (default 5: 2 eyes, nose, 2 mouth)
-        """
+
+    def __init__(
+        self,
+        in_channels: int = 256,
+        num_landmarks: int = 5,
+        feat_levels: Tuple[str, ...] = ('p3', 'p4'),
+    ):
         super().__init__()
-        
+        self.feat_levels = feat_levels
         self.num_landmarks = num_landmarks
-        
-        # Detection layers
-        self.conv1 = nn.Sequential(
-            nn.Conv2d(in_channels, 256, 3, padding=1),
-            nn.BatchNorm2d(256),
-            nn.ReLU(inplace=True)
-        )
-        
-        self.conv2 = nn.Sequential(
-            nn.Conv2d(256, 256, 3, padding=1),
-            nn.BatchNorm2d(256),
-            nn.ReLU(inplace=True)
-        )
-        
-        # Classification head (face/no-face)
-        self.cls_head = nn.Conv2d(256, 2, 1)
-        
-        # Bounding box regression head
-        self.bbox_head = nn.Conv2d(256, 4, 1)
-        
-        # Landmark regression head (x, y for each landmark)
-        self.landmark_head = nn.Conv2d(256, num_landmarks * 2, 1)
-        
-        # Initialize weights
-        self._init_weights()
-    
-    def _init_weights(self):
-        for m in self.modules():
-            if isinstance(m, nn.Conv2d):
-                nn.init.normal_(m.weight, std=0.01)
-                if m.bias is not None:
-                    nn.init.constant_(m.bias, 0)
-    
-    def forward(self, features: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
-        """
-        Args:
-            features: Multi-scale features from backbone {'p3', 'p4', 'p5'}
-            
-        Returns:
-            Dictionary containing:
-            - 'face_cls': Classification scores [B, 2, H, W]
-            - 'face_bbox': Bounding box regression [B, 4, H, W]
-            - 'face_landmarks': Landmark coordinates [B, num_landmarks*2, H, W]
-        """
-        # Use P3 features (1/8 resolution) for face detection (smaller objects)
-        x = features['p3']
-        
-        # Apply detection layers
-        x = self.conv1(x)
-        x = self.conv2(x)
-        
-        # Classification, bbox, and landmarks
-        cls_output = self.cls_head(x)
-        bbox_output = self.bbox_head(x)
-        landmark_output = self.landmark_head(x)
-        
+
+        self.cls_subnet = ConvSubnet(in_channels, 256, num_convs=2)
+        self.reg_subnet = ConvSubnet(in_channels, 256, num_convs=2)
+
+        self.cls_head = nn.Conv2d(256, 1, 3, padding=1)
+        self.reg_head = nn.Conv2d(256, 4, 3, padding=1)
+        self.ctr_head = nn.Conv2d(256, 1, 3, padding=1)
+        self.lmk_head = nn.Conv2d(256, num_landmarks * 2, 3, padding=1)
+
+        self.scales = nn.ParameterDict({
+            lvl: nn.Parameter(torch.ones(1)) for lvl in feat_levels
+        })
+        self._init_heads()
+
+    def _init_heads(self):
+        for m in [self.cls_head, self.reg_head, self.ctr_head, self.lmk_head]:
+            nn.init.normal_(m.weight, std=0.01)
+            nn.init.constant_(m.bias, 0)
+        nn.init.constant_(self.cls_head.bias, -4.6)
+
+    def forward(
+        self, features: Dict[str, torch.Tensor]
+    ) -> Dict[str, List[torch.Tensor]]:
+        cls_out, reg_out, ctr_out, lmk_out = [], [], [], []
+        for lvl in self.feat_levels:
+            cls_feat = self.cls_subnet(features[lvl])
+            reg_feat = self.reg_subnet(features[lvl])
+
+            cls_out.append(self.cls_head(cls_feat))
+            reg_out.append(
+                torch.exp(self.reg_head(reg_feat).clamp(max=8.0))
+                * self.scales[lvl]
+            )
+            ctr_out.append(self.ctr_head(cls_feat))
+            lmk_out.append(self.lmk_head(reg_feat))
+
         return {
-            'face_cls': cls_output,
-            'face_bbox': bbox_output,
-            'face_landmarks': landmark_output
+            'face_cls': cls_out, 'face_reg': reg_out,
+            'face_ctr': ctr_out, 'face_lmk': lmk_out,
         }
 
+
+# ---------------------------------------------------------------------------
+# Hand Head
+# ---------------------------------------------------------------------------
 
 class HandHead(nn.Module):
     """
-    Detection head for hand keypoint detection
-    Outputs: 21 hand keypoints (MediaPipe convention)
+    FCOS-style hand detection + keypoint head — single scale (p3)
+
+    Outputs per FPN level:
+      hand_cls       [B, 1, H, W]   classification logit
+      hand_reg       [B, 4, H, W]   ltrb distances (pixels)
+      hand_ctr       [B, 1, H, W]   centerness logit
+      hand_heatmaps  [B, 21, H, W]  keypoint visibility logits
+      hand_offsets   [B, 42, H, W]  21 keypoints × (dx, dy) offsets / stride
     """
-    
-    def __init__(self, in_channels: int = 256, num_keypoints: int = 21):
-        """
-        Args:
-            in_channels: Input feature channels from backbone
-            num_keypoints: Number of hand keypoints (21 for MediaPipe standard)
-        """
+
+    def __init__(
+        self,
+        in_channels: int = 256,
+        num_keypoints: int = 21,
+        feat_levels: Tuple[str, ...] = ('p3',),
+    ):
         super().__init__()
-        
+        self.feat_levels = feat_levels
         self.num_keypoints = num_keypoints
-        
-        # Detection layers with more capacity for keypoint regression
-        self.conv1 = nn.Sequential(
-            nn.Conv2d(in_channels, 256, 3, padding=1),
-            nn.BatchNorm2d(256),
-            nn.ReLU(inplace=True)
-        )
-        
-        self.conv2 = nn.Sequential(
-            nn.Conv2d(256, 256, 3, padding=1),
-            nn.BatchNorm2d(256),
-            nn.ReLU(inplace=True)
-        )
-        
-        self.conv3 = nn.Sequential(
-            nn.Conv2d(256, 256, 3, padding=1),
-            nn.BatchNorm2d(256),
-            nn.ReLU(inplace=True)
-        )
-        
-        # Hand presence classification
-        self.cls_head = nn.Conv2d(256, 2, 1)  # hand/no-hand
-        
-        # Keypoint heatmap regression (one heatmap per keypoint)
-        self.keypoint_head = nn.Conv2d(256, num_keypoints, 1)
-        
-        # Keypoint offset regression (x, y offset for each keypoint)
+
+        self.cls_subnet = ConvSubnet(in_channels, 256, num_convs=2)
+        self.reg_subnet = ConvSubnet(in_channels, 256, num_convs=2)
+        self.kpt_subnet = ConvSubnet(in_channels, 256, num_convs=3)  # deeper
+
+        self.cls_head = nn.Conv2d(256, 1, 3, padding=1)
+        self.reg_head = nn.Conv2d(256, 4, 3, padding=1)
+        self.ctr_head = nn.Conv2d(256, 1, 3, padding=1)
+        self.heatmap_head = nn.Conv2d(256, num_keypoints, 1)
         self.offset_head = nn.Conv2d(256, num_keypoints * 2, 1)
-        
-        # Initialize weights
-        self._init_weights()
-    
-    def _init_weights(self):
-        for m in self.modules():
-            if isinstance(m, nn.Conv2d):
-                nn.init.normal_(m.weight, std=0.01)
-                if m.bias is not None:
-                    nn.init.constant_(m.bias, 0)
-    
-    def forward(self, features: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
-        """
-        Args:
-            features: Multi-scale features from backbone {'p3', 'p4', 'p5'}
-            
-        Returns:
-            Dictionary containing:
-            - 'hand_cls': Hand presence classification [B, 2, H, W]
-            - 'hand_heatmaps': Keypoint heatmaps [B, 21, H, W]
-            - 'hand_offsets': Keypoint offsets [B, 42, H, W]
-        """
-        # Use P3 features (1/8 resolution) for hand keypoints
-        x = features['p3']
-        
-        # Apply detection layers
-        x = self.conv1(x)
-        x = self.conv2(x)
-        x = self.conv3(x)
-        
-        # Classification, heatmaps, and offsets
-        cls_output = self.cls_head(x)
-        heatmap_output = self.keypoint_head(x)
-        offset_output = self.offset_head(x)
-        
+
+        self.scales = nn.ParameterDict({
+            lvl: nn.Parameter(torch.ones(1)) for lvl in feat_levels
+        })
+        self._init_heads()
+
+    def _init_heads(self):
+        for m in [self.cls_head, self.reg_head, self.ctr_head,
+                  self.heatmap_head, self.offset_head]:
+            nn.init.normal_(m.weight, std=0.01)
+            nn.init.constant_(m.bias, 0)
+        nn.init.constant_(self.cls_head.bias, -4.6)
+
+    def forward(
+        self, features: Dict[str, torch.Tensor]
+    ) -> Dict[str, List[torch.Tensor]]:
+        cls_out, reg_out, ctr_out = [], [], []
+        hm_out, off_out = [], []
+
+        for lvl in self.feat_levels:
+            cls_feat = self.cls_subnet(features[lvl])
+            reg_feat = self.reg_subnet(features[lvl])
+            kpt_feat = self.kpt_subnet(features[lvl])
+
+            cls_out.append(self.cls_head(cls_feat))
+            reg_out.append(
+                torch.exp(self.reg_head(reg_feat).clamp(max=8.0))
+                * self.scales[lvl]
+            )
+            ctr_out.append(self.ctr_head(cls_feat))
+            hm_out.append(self.heatmap_head(kpt_feat))
+            off_out.append(self.offset_head(kpt_feat))
+
         return {
-            'hand_cls': cls_output,
-            'hand_heatmaps': heatmap_output,
-            'hand_offsets': offset_output
+            'hand_cls': cls_out, 'hand_reg': reg_out, 'hand_ctr': ctr_out,
+            'hand_heatmaps': hm_out, 'hand_offsets': off_out,
         }
 
 
+# ---------------------------------------------------------------------------
+# Multi-Task Head (combines all heads)
+# ---------------------------------------------------------------------------
+
 class MultiTaskHead(nn.Module):
-    """
-    Combines all task-specific heads
-    """
-    
+    """Combines PersonHead + FaceHead + HandHead"""
+
     def __init__(self, in_channels: int = 256):
-        """
-        Args:
-            in_channels: Input feature channels from backbone
-        """
         super().__init__()
-        
         self.person_head = PersonHead(in_channels=in_channels)
         self.face_head = FaceHead(in_channels=in_channels)
         self.hand_head = HandHead(in_channels=in_channels)
-    
-    def forward(self, features: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
-        """
-        Args:
-            features: Multi-scale features from backbone
-            
-        Returns:
-            Dictionary containing all task outputs
-        """
-        # Get outputs from each head
-        person_output = self.person_head(features)
-        face_output = self.face_head(features)
-        hand_output = self.hand_head(features)
-        
-        # Combine all outputs
+
+    def forward(
+        self, features: Dict[str, torch.Tensor]
+    ) -> Dict[str, List[torch.Tensor]]:
         outputs = {}
-        outputs.update(person_output)
-        outputs.update(face_output)
-        outputs.update(hand_output)
-        
+        outputs.update(self.person_head(features))
+        outputs.update(self.face_head(features))
+        outputs.update(self.hand_head(features))
         return outputs
 
 
+# ---------------------------------------------------------------------------
+# Test
+# ---------------------------------------------------------------------------
+
 if __name__ == '__main__':
-    # Test heads
-    print("Testing Multi-Task Heads...")
-    
-    # Create dummy features
-    batch_size = 2
+    print("Testing FCOS-style Multi-Task Heads...\n")
+
+    batch = 2
     features = {
-        'p3': torch.randn(batch_size, 256, 80, 80),  # 1/8 resolution
-        'p4': torch.randn(batch_size, 256, 40, 40),  # 1/16 resolution
-        'p5': torch.randn(batch_size, 256, 20, 20),  # 1/32 resolution
+        'p3': torch.randn(batch, 256, 80, 80),
+        'p4': torch.randn(batch, 256, 40, 40),
+        'p5': torch.randn(batch, 256, 20, 20),
     }
-    
-    # Test individual heads
-    print("\n1. PersonHead:")
-    person_head = PersonHead(in_channels=256)
-    person_out = person_head(features)
-    for k, v in person_out.items():
-        print(f"   {k}: {v.shape}")
-    
-    print("\n2. FaceHead:")
-    face_head = FaceHead(in_channels=256)
-    face_out = face_head(features)
-    for k, v in face_out.items():
-        print(f"   {k}: {v.shape}")
-    
-    print("\n3. HandHead:")
-    hand_head = HandHead(in_channels=256)
-    hand_out = hand_head(features)
-    for k, v in hand_out.items():
-        print(f"   {k}: {v.shape}")
-    
-    print("\n4. MultiTaskHead (combined):")
-    multi_head = MultiTaskHead(in_channels=256)
-    all_outputs = multi_head(features)
-    for k, v in all_outputs.items():
-        print(f"   {k}: {v.shape}")
-    
-    # Count parameters
-    total_params = sum(p.numel() for p in multi_head.parameters())
-    print(f"\nTotal head parameters: {total_params:,}")
+
+    for name, Head in [('PersonHead', PersonHead), ('FaceHead', FaceHead),
+                       ('HandHead', HandHead)]:
+        head = Head(256)
+        out = head(features)
+        print(f"{name} (levels={head.feat_levels}):")
+        for k, v_list in out.items():
+            shapes = ', '.join(str(v.shape) for v in v_list)
+            print(f"  {k}: [{shapes}]")
+        print()
+
+    print("MultiTaskHead:")
+    mt = MultiTaskHead(256)
+    mo = mt(features)
+    for k, v_list in mo.items():
+        shapes = ', '.join(str(v.shape) for v in v_list)
+        print(f"  {k}: [{shapes}]")
+
+    total = sum(p.numel() for p in mt.parameters())
+    print(f"\nTotal head parameters: {total:,}")

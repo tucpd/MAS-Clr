@@ -8,7 +8,7 @@ import torch.nn as nn
 from typing import Dict, Optional
 from pathlib import Path
 
-from .multi_task.backbone import SharedBackbone
+from .backbone import SharedBackbone
 from .heads import MultiTaskHead
 
 
@@ -82,18 +82,22 @@ class UnifiedMultiTaskModel(nn.Module):
             x: Input image tensor [B, 3, H, W]
             
         Returns:
-            Dictionary containing all task outputs:
-            Person Detection:
-                - person_cls: [B, 2, H/16, W/16]
-                - person_reg: [B, 4, H/16, W/16]
-            Face Detection:
-                - face_cls: [B, 2, H/8, W/8]
-                - face_bbox: [B, 4, H/8, W/8]
-                - face_landmarks: [B, 10, H/8, W/8]
-            Hand Keypoints:
-                - hand_cls: [B, 2, H/8, W/8]
-                - hand_heatmaps: [B, 21, H/8, W/8]
-                - hand_offsets: [B, 42, H/8, W/8]
+            Dict[str, List[Tensor]] — each value is a list (one per FPN level):
+            Person (levels: p3, p4, p5):
+                - person_cls: [B, 1, H, W]  classification logit
+                - person_reg: [B, 4, H, W]  FCOS ltrb (pixels)
+                - person_ctr: [B, 1, H, W]  centerness logit
+            Face (levels: p3, p4):
+                - face_cls: [B, 1, H, W]
+                - face_reg: [B, 4, H, W]
+                - face_ctr: [B, 1, H, W]
+                - face_lmk: [B, 10, H, W]  landmark offsets / stride
+            Hand (levels: p3):
+                - hand_cls: [B, 1, H, W]
+                - hand_reg: [B, 4, H, W]
+                - hand_ctr: [B, 1, H, W]
+                - hand_heatmaps: [B, 21, H, W]  keypoint visibility
+                - hand_offsets:  [B, 42, H, W]  keypoint offsets / stride
         """
         # Extract shared features from backbone
         features = self.backbone(x)
@@ -102,7 +106,16 @@ class UnifiedMultiTaskModel(nn.Module):
         outputs = self.heads(features)
         
         return outputs
-    
+
+    @property
+    def feat_levels(self):
+        """Feature levels used by each task head"""
+        return {
+            'person': self.heads.person_head.feat_levels,
+            'face':   self.heads.face_head.feat_levels,
+            'hand':   self.heads.hand_head.feat_levels,
+        }
+
     def save(self, path: str):
         """
         Save model weights
@@ -206,29 +219,23 @@ if __name__ == '__main__':
     model.eval()
     with torch.no_grad():
         outputs = model(x)
-    
-    print("\nOutput shapes:")
-    print("-" * 40)
-    print("Person Detection:")
-    print(f"  person_cls: {outputs['person_cls'].shape}")
-    print(f"  person_reg: {outputs['person_reg'].shape}")
-    print("\nFace Detection:")
-    print(f"  face_cls: {outputs['face_cls'].shape}")
-    print(f"  face_bbox: {outputs['face_bbox'].shape}")
-    print(f"  face_landmarks: {outputs['face_landmarks'].shape}")
-    print("\nHand Keypoints:")
-    print(f"  hand_cls: {outputs['hand_cls'].shape}")
-    print(f"  hand_heatmaps: {outputs['hand_heatmaps'].shape}")
-    print(f"  hand_offsets: {outputs['hand_offsets'].shape}")
-    
+
+    print("\nOutput shapes (List[Tensor] per FPN level):")
+    print("-" * 50)
+    for key, val_list in outputs.items():
+        shapes = ', '.join(str(v.shape) for v in val_list)
+        print(f"  {key}: [{shapes}]")
+
+    # Feature levels per task
+    print(f"\nFeat levels: {model.feat_levels}")
+
     # Measure inference time
     print("\n" + "=" * 60)
     print("Measuring Inference Speed")
     print("=" * 60)
     
     import time
-    
-    # Warmup
+
     for _ in range(10):
         _ = model.inference(x)
     
@@ -241,7 +248,6 @@ if __name__ == '__main__':
     
     avg_time = (end - start) / num_runs * 1000  # ms
     fps = 1000 / avg_time
-    
     print(f"Average inference time: {avg_time:.2f} ms")
     print(f"FPS: {fps:.1f}")
     
@@ -265,7 +271,8 @@ if __name__ == '__main__':
         outputs2 = model2(x)
     
     match = all(
-        torch.allclose(outputs[k], outputs2[k], atol=1e-6)
+        all(torch.allclose(a, b, atol=1e-6)
+            for a, b in zip(outputs[k], outputs2[k]))
         for k in outputs.keys()
     )
     print(f"\nOutputs match after loading: {match}")
