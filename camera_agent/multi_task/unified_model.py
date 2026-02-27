@@ -8,7 +8,7 @@ import torch.nn as nn
 from typing import Dict, Optional
 from pathlib import Path
 
-from .backbone import SharedBackbone
+from .multi_task.backbone import SharedBackbone
 from .heads import MultiTaskHead
 
 
@@ -130,7 +130,7 @@ class UnifiedMultiTaskModel(nn.Module):
             path: Path to checkpoint
             strict: Strict loading (all keys must match)
         """
-        checkpoint = torch.load(path, map_location='cpu')
+        checkpoint = torch.load(path, map_location='cpu', weights_only=True)
         self.load_state_dict(checkpoint['model_state_dict'], strict=strict)
         print(f"Model loaded from {path}")
     
