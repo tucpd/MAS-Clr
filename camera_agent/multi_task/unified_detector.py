@@ -6,15 +6,22 @@ Single forward pass → all detections.
 """
 
 import cv2
+import json
 import torch
 import numpy as np
+import logging
 from torchvision.ops import nms
-from typing import Dict, List, Tuple, Optional
-from dataclasses import dataclass
+from typing import Dict, List, Tuple, Optional, Any
+from dataclasses import dataclass, field, asdict
 import time
 
 from .unified_model import create_unified_model
-from .heads import STRIDES
+from .heads import STRIDES, GESTURE_CLASSES
+
+logger = logging.getLogger(__name__)
+
+# Mapping gesture index → tên lệnh điều khiển
+GESTURE_LABELS = {i: name for i, name in enumerate(GESTURE_CLASSES)}
 
 
 # ---------------------------------------------------------------------------
@@ -45,6 +52,40 @@ class HandDetection:
     keypoints: np.ndarray  # [21, 2] - 21 hand keypoints (x, y)
     confidence: float
     visibility: np.ndarray  # [21] - visibility score for each keypoint
+    gesture: Optional[str] = None  # Tên gesture (None nếu không có)
+
+
+@dataclass
+class CameraAgentOutput:
+    """
+    Output chuẩn của Camera Agent — match input schema của Device Control Agent
+    
+    Fields:
+        num_people: Số người trong lớp
+        teacher_preferences: Sở thích thiết bị của giáo viên (rỗng nếu không nhận diện được)
+        gesture_command: Lệnh gesture (None nếu không có)
+        teacher_id: ID giáo viên được nhận diện (None nếu không)
+    """
+    num_people: int = 0
+    teacher_preferences: Dict[str, Any] = field(default_factory=dict)
+    gesture_command: Optional[str] = None
+    teacher_id: Optional[str] = None
+
+    def to_json(self) -> str:
+        """Sinh JSON chuẩn cho Device Control Agent"""
+        return json.dumps({
+            'num_students': self.num_people,
+            'teacher_preferences': self.teacher_preferences,
+            'gesture_command': self.gesture_command,
+        }, ensure_ascii=False)
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Trả về dict chuẩn"""
+        return {
+            'num_students': self.num_people,
+            'teacher_preferences': self.teacher_preferences,
+            'gesture_command': self.gesture_command,
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -70,6 +111,8 @@ class UnifiedDetector:
         confidence_threshold: float = 0.5,
         nms_iou: float = 0.5,
         image_size: int = 640,
+        arcface_config: Optional[Any] = None,
+        teacher_db_path: Optional[str] = None,
     ):
         """
         Args:
@@ -79,6 +122,8 @@ class UnifiedDetector:
             confidence_threshold: Min score (cls × centerness) to keep
             nms_iou: IoU threshold for NMS
             image_size: Input image size (square)
+            arcface_config: ArcFaceConfig (None = không dùng teacher recognition)
+            teacher_db_path: Đường dẫn teacher database
         """
         self.device = device
         self.confidence_threshold = confidence_threshold
@@ -91,6 +136,8 @@ class UnifiedDetector:
             pretrained=True,
             feature_channels=256,
             checkpoint_path=checkpoint_path,
+            arcface_config=arcface_config,
+            teacher_db_path=teacher_db_path,
         )
         self.model.to(device)
         self.model.eval()
@@ -374,6 +421,84 @@ class UnifiedDetector:
         ]
 
     # ------------------------------------------------------------------
+    # Gesture decode
+    # ------------------------------------------------------------------
+
+    def decode_gesture(
+        self,
+        outputs: Dict[str, List[torch.Tensor]],
+        hands: List[HandDetection],
+        scale: float,
+    ) -> Optional[str]:
+        """
+        Decode gesture từ hand detections + gesture head output.
+        Lấy gesture của tay có confidence cao nhất.
+
+        Returns:
+            Tên gesture (str) hoặc None nếu không có hand / gesture là 'none'
+        """
+        if not hands or 'hand_gesture' not in outputs:
+            return None
+
+        # Lấy hand có confidence cao nhất
+        best_hand = max(hands, key=lambda h: h.confidence)
+        cx = (best_hand.bbox[0] + best_hand.bbox[2]) / 2 * scale
+        cy = (best_hand.bbox[1] + best_hand.bbox[3]) / 2 * scale
+
+        # Lấy gesture logits tại vị trí center của hand trên feature map p3
+        stride = STRIDES['p3']
+        gesture_map = outputs['hand_gesture'][0][0]  # [6, H, W]
+        gx = int(cx / stride)
+        gy = int(cy / stride)
+        gx = min(max(gx, 0), gesture_map.shape[2] - 1)
+        gy = min(max(gy, 0), gesture_map.shape[1] - 1)
+
+        logits = gesture_map[:, gy, gx]  # [6]
+        gesture_idx = logits.argmax().item()
+        gesture_label = GESTURE_LABELS.get(gesture_idx, 'none')
+
+        # Trả về None nếu gesture là 'none'
+        if gesture_label == 'none':
+            return None
+
+        # Gán gesture vào hand detection
+        best_hand.gesture = gesture_label
+        return gesture_label
+
+    # ------------------------------------------------------------------
+    # Teacher recognition
+    # ------------------------------------------------------------------
+
+    def recognize_teacher(
+        self,
+        image: np.ndarray,
+        faces: List[FaceDetection],
+    ) -> Tuple[Optional[str], Dict[str, Any]]:
+        """
+        Nhận diện giáo viên từ face detections → ArcFace → DB lookup.
+        Lấy face có confidence cao nhất để recognize.
+
+        Returns:
+            (teacher_id, teacher_preferences)
+        """
+        if not faces or self.model.arcface_recognizer is None:
+            return None, {}
+
+        # Lấy face có confidence cao nhất
+        best_face = max(faces, key=lambda f: f.confidence)
+        x1, y1, x2, y2 = best_face.bbox.astype(int)
+
+        # Clamp và crop face từ ảnh gốc
+        h, w = image.shape[:2]
+        x1, y1 = max(0, x1), max(0, y1)
+        x2, y2 = min(w, x2), min(h, y2)
+        if x2 <= x1 or y2 <= y1:
+            return None, {}
+
+        face_crop = image[y1:y2, x1:x2]
+        return self.model.recognize_teacher(face_crop)
+
+    # ------------------------------------------------------------------
     # Main entry point
     # ------------------------------------------------------------------
 
@@ -381,7 +506,7 @@ class UnifiedDetector:
     def detect(
         self, image: np.ndarray,
     ) -> Tuple[List[PersonDetection], List[FaceDetection],
-               List[HandDetection], float]:
+               List[HandDetection], CameraAgentOutput, float]:
         """
         Unified detection on single image
         
@@ -389,7 +514,7 @@ class UnifiedDetector:
             image: BGR image [H, W, 3]
             
         Returns:
-            (people, faces, hands, inference_time_ms)
+            (people, faces, hands, camera_output, inference_time_ms)
         """
         start = time.time()
         
@@ -404,8 +529,22 @@ class UnifiedDetector:
         faces = self.detect_faces(outputs, scale, orig_shape)
         hands = self.detect_hands(outputs, scale, orig_shape)
 
+        # Decode gesture từ hand detections
+        gesture_cmd = self.decode_gesture(outputs, hands, scale)
+
+        # Nhận diện giáo viên từ face detections
+        teacher_id, teacher_prefs = self.recognize_teacher(image, faces)
+
+        # Tạo output chuẩn cho Device Control Agent
+        camera_output = CameraAgentOutput(
+            num_people=len(people),
+            teacher_preferences=teacher_prefs,
+            gesture_command=gesture_cmd,
+            teacher_id=teacher_id,
+        )
+
         inference_time = (time.time() - start) * 1000
-        return people, faces, hands, inference_time
+        return people, faces, hands, camera_output, inference_time
 
 
 # ---------------------------------------------------------------------------
@@ -424,18 +563,20 @@ if __name__ == '__main__':
     
     # Create test image
     test_image = np.random.randint(0, 255, (480, 640, 3), dtype=np.uint8)
-    people, faces, hands, t = detector.detect(test_image)
+    people, faces, hands, cam_output, t = detector.detect(test_image)
 
     print(f"Results:")
     print(f"  People: {len(people)}")
     print(f"  Faces:  {len(faces)}")
     print(f"  Hands:  {len(hands)}")
     print(f"  Time:   {t:.2f} ms")
+    print(f"\nCameraAgentOutput:")
+    print(f"  JSON: {cam_output.to_json()}")
 
     print("\nBenchmarking (50 iterations)...")
     times = []
     for _ in range(50):
-        _, _, _, t = detector.detect(test_image)
+        _, _, _, _, t = detector.detect(test_image)
         times.append(t)
 
     print(f"Average: {np.mean(times):.2f} ms")

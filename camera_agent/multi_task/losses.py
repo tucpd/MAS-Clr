@@ -208,6 +208,32 @@ class WingLoss(nn.Module):
 
 
 # ---------------------------------------------------------------------------
+# Gesture Loss
+# ---------------------------------------------------------------------------
+
+class GestureLoss(nn.Module):
+    """
+    Cross-entropy loss cho gesture classification (6 classes).
+    Wrapper đơn giản quanh CrossEntropyLoss chuẩn.
+    """
+
+    def __init__(self, num_classes: int = 6, reduction: str = 'mean'):
+        super().__init__()
+        self.ce = nn.CrossEntropyLoss(reduction=reduction)
+        self.num_classes = num_classes
+
+    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            pred:   Gesture logits [N, 6]
+            target: Ground-truth labels [N] (int 0-5)
+        """
+        if pred.numel() == 0:
+            return pred.sum() * 0.0
+        return self.ce(pred, target)
+
+
+# ---------------------------------------------------------------------------
 # Multi-Task Loss (Uncertainty Weighting)
 # ---------------------------------------------------------------------------
 
@@ -240,6 +266,7 @@ class MultiTaskLoss(nn.Module):
         'person_cls', 'person_reg', 'person_ctr',
         'face_cls',   'face_reg',   'face_ctr',  'face_lmk',
         'hand_cls',   'hand_reg',   'hand_ctr',  'hand_kpt', 'hand_hm',
+        'hand_gesture',
     ]
 
     def __init__(self, task_names: List[str] = None):
@@ -312,6 +339,12 @@ if __name__ == '__main__':
     gt_lmk = pred_lmk + torch.randn_like(pred_lmk) * 2
     print(f"WingLoss:       {wl(pred_lmk, gt_lmk).item():.4f}")
 
+    # --- Gesture Loss ---
+    gl2 = GestureLoss()
+    ges_pred = torch.randn(10, 6)
+    ges_target = torch.randint(0, 6, (10,))
+    print(f"GestureLoss:    {gl2(ges_pred, ges_target).item():.4f}")
+
     # --- MultiTaskLoss ---
     mt = MultiTaskLoss()
     dummy_losses = {
@@ -320,6 +353,7 @@ if __name__ == '__main__':
         'person_ctr': torch.tensor(0.3),
         'face_cls':   torch.tensor(1.2),
         'face_reg':   torch.tensor(0.6),
+        'hand_gesture': torch.tensor(0.9),
     }
     total, info = mt(dummy_losses)
     print(f"\nMultiTaskLoss:")

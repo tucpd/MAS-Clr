@@ -5,11 +5,26 @@ Combines shared backbone with task-specific heads for efficient inference
 
 import torch
 import torch.nn as nn
-from typing import Dict, Optional
+import numpy as np
+import pickle
+import logging
+from typing import Dict, Optional, Tuple, Any
 from pathlib import Path
 
 from .backbone import SharedBackbone
 from .heads import MultiTaskHead
+
+# ArcFace là optional — chỉ dùng khi inference nhận diện giáo viên
+try:
+    import sys, os
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+    from old_architecture.arcface_recognizer import ArcFaceRecognizer, ArcFaceConfig
+    ARCFACE_AVAILABLE = True
+except ImportError:
+    ARCFACE_AVAILABLE = False
+    logging.warning("ArcFace not available. Teacher recognition disabled.")
+
+logger = logging.getLogger(__name__)
 
 
 class UnifiedMultiTaskModel(nn.Module):
@@ -30,7 +45,9 @@ class UnifiedMultiTaskModel(nn.Module):
         backbone_name: str = 'mobilenetv3_large_100',
         pretrained: bool = True,
         feature_channels: int = 256,
-        freeze_backbone: bool = False
+        freeze_backbone: bool = False,
+        arcface_config: Optional[Any] = None,
+        teacher_db_path: Optional[str] = None,
     ):
         """
         Args:
@@ -38,6 +55,8 @@ class UnifiedMultiTaskModel(nn.Module):
             pretrained: Use ImageNet pretrained weights
             feature_channels: Feature dimension for FPN
             freeze_backbone: Freeze backbone weights
+            arcface_config: ArcFaceConfig instance (None = không dùng ArcFace)
+            teacher_db_path: Đường dẫn file teacher database pickle
         """
         super().__init__()
         
@@ -54,11 +73,29 @@ class UnifiedMultiTaskModel(nn.Module):
         
         # Task-specific heads
         self.heads = MultiTaskHead(in_channels=feature_channels)
+
+        # ArcFace recognizer (optional, inference-only, không tham gia training)
+        self.arcface_recognizer = None
+        self.teacher_preferences_db = {}  # {teacher_id: {preferences dict}}
+        if arcface_config is not None and ARCFACE_AVAILABLE:
+            try:
+                self.arcface_recognizer = ArcFaceRecognizer(
+                    config=arcface_config,
+                    database_path=teacher_db_path or "teacher_database_arcface.pkl"
+                )
+                self.arcface_recognizer.initialize()
+                # Load teacher preferences DB nếu có
+                self._load_teacher_preferences(teacher_db_path)
+                logger.info("ArcFace recognizer initialized")
+            except Exception as e:
+                logger.warning(f"Failed to init ArcFace: {e}. Continuing without.")
+                self.arcface_recognizer = None
         
         print(f"\n=== Unified Multi-Task Model ===")
         print(f"Backbone: {backbone_name}")
         print(f"Feature channels: {feature_channels}")
-        print(f"Tasks: Person Detection, Face Detection, Hand Keypoints")
+        print(f"Tasks: Person Detection, Face Detection, Hand Keypoints + Gesture")
+        print(f"ArcFace: {'enabled' if self.arcface_recognizer else 'disabled'}")
         
         self._print_model_info()
     
@@ -73,6 +110,53 @@ class UnifiedMultiTaskModel(nn.Module):
         print(f"  Heads: {head_params:,}")
         print(f"  Total: {total_params:,}")
         print(f"  Size: ~{total_params * 4 / 1024 / 1024:.1f} MB")
+
+    def _load_teacher_preferences(self, db_path: Optional[str]):
+        """Load teacher preferences database (teacher_id → sở thích thiết bị)"""
+        prefs_path = db_path.replace('.pkl', '_preferences.pkl') if db_path else None
+        if prefs_path and Path(prefs_path).exists():
+            try:
+                with open(prefs_path, 'rb') as f:
+                    self.teacher_preferences_db = pickle.load(f)
+                logger.info(f"Loaded {len(self.teacher_preferences_db)} teacher preferences")
+            except Exception as e:
+                logger.warning(f"Failed to load teacher preferences: {e}")
+
+    def recognize_teacher(
+        self, face_crop: np.ndarray
+    ) -> Tuple[Optional[str], Dict[str, Any]]:
+        """
+        Nhận diện giáo viên từ face crop → trả về ID + preferences
+        
+        Args:
+            face_crop: BGR face image crop
+        Returns:
+            (teacher_id, preferences_dict)
+            Nếu không nhận diện được: (None, {})
+        """
+        if self.arcface_recognizer is None:
+            return None, {}
+        
+        try:
+            faces = self.arcface_recognizer.detect_and_extract(face_crop)
+            if not faces:
+                return None, {}
+            
+            # Lấy face có det_score cao nhất
+            best_face = max(faces, key=lambda f: f['det_score'])
+            teacher_id, similarity = self.arcface_recognizer.recognize_face(
+                best_face['embedding']
+            )
+            
+            if teacher_id is not None:
+                preferences = self.teacher_preferences_db.get(teacher_id, {})
+                logger.info(f"Recognized teacher: {teacher_id} (sim={similarity:.3f})")
+                return teacher_id, preferences
+            
+            return None, {}
+        except Exception as e:
+            logger.warning(f"Teacher recognition error: {e}")
+            return None, {}
     
     def forward(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
         """
@@ -98,6 +182,7 @@ class UnifiedMultiTaskModel(nn.Module):
                 - hand_ctr: [B, 1, H, W]
                 - hand_heatmaps: [B, 21, H, W]  keypoint visibility
                 - hand_offsets:  [B, 42, H, W]  keypoint offsets / stride
+                - hand_gesture:  [B, 6, H, W]   gesture classification logits
         """
         # Extract shared features from backbone
         features = self.backbone(x)
@@ -166,7 +251,9 @@ def create_unified_model(
     backbone_name: str = 'mobilenetv3_large_100',
     pretrained: bool = True,
     feature_channels: int = 256,
-    checkpoint_path: Optional[str] = None
+    checkpoint_path: Optional[str] = None,
+    arcface_config: Optional[Any] = None,
+    teacher_db_path: Optional[str] = None,
 ) -> UnifiedMultiTaskModel:
     """
     Factory function to create unified model
@@ -176,6 +263,8 @@ def create_unified_model(
         pretrained: Use pretrained backbone
         feature_channels: Feature dimension
         checkpoint_path: Path to trained checkpoint (optional)
+        arcface_config: ArcFaceConfig (None = không dùng ArcFace)
+        teacher_db_path: Đường dẫn teacher database
         
     Returns:
         UnifiedMultiTaskModel instance
@@ -183,7 +272,9 @@ def create_unified_model(
     model = UnifiedMultiTaskModel(
         backbone_name=backbone_name,
         pretrained=pretrained,
-        feature_channels=feature_channels
+        feature_channels=feature_channels,
+        arcface_config=arcface_config,
+        teacher_db_path=teacher_db_path,
     )
     
     if checkpoint_path is not None:

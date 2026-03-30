@@ -19,6 +19,17 @@ from typing import Dict, List, Tuple
 # FPN level strides (determined by backbone + FPN)
 STRIDES = {'p3': 8, 'p4': 16, 'p5': 32}
 
+# 6 class gesture cho điều khiển thiết bị lớp học
+GESTURE_CLASSES = [
+    'none',              # 0: không có gesture
+    'lights_on',         # 1: bật đèn
+    'lights_off',        # 2: tắt đèn
+    'fan_up',            # 3: tăng quạt
+    'fan_down',          # 4: giảm quạt
+    'projector_toggle',  # 5: bật/tắt máy chiếu
+]
+NUM_GESTURES = len(GESTURE_CLASSES)
+
 
 class ConvSubnet(nn.Module):
     """Shared convolutional subnet: N × (Conv3x3 + GroupNorm + ReLU)"""
@@ -183,7 +194,7 @@ class FaceHead(nn.Module):
 
 class HandHead(nn.Module):
     """
-    FCOS-style hand detection + keypoint head — single scale (p3)
+    FCOS-style hand detection + keypoint + gesture head — single scale (p3)
 
     Outputs per FPN level:
       hand_cls       [B, 1, H, W]   classification logit
@@ -191,6 +202,7 @@ class HandHead(nn.Module):
       hand_ctr       [B, 1, H, W]   centerness logit
       hand_heatmaps  [B, 21, H, W]  keypoint visibility logits
       hand_offsets   [B, 42, H, W]  21 keypoints × (dx, dy) offsets / stride
+      hand_gesture   [B, 6, H, W]   gesture classification logits (6 classes)
     """
 
     def __init__(
@@ -212,6 +224,8 @@ class HandHead(nn.Module):
         self.ctr_head = nn.Conv2d(256, 1, 3, padding=1)
         self.heatmap_head = nn.Conv2d(256, num_keypoints, 1)
         self.offset_head = nn.Conv2d(256, num_keypoints * 2, 1)
+        # Gesture head: chia sẻ kpt_subnet features, output 6 classes
+        self.gesture_head = nn.Conv2d(256, NUM_GESTURES, 1)
 
         self.scales = nn.ParameterDict({
             lvl: nn.Parameter(torch.ones(1)) for lvl in feat_levels
@@ -220,7 +234,7 @@ class HandHead(nn.Module):
 
     def _init_heads(self):
         for m in [self.cls_head, self.reg_head, self.ctr_head,
-                  self.heatmap_head, self.offset_head]:
+                  self.heatmap_head, self.offset_head, self.gesture_head]:
             nn.init.normal_(m.weight, std=0.01)
             nn.init.constant_(m.bias, 0)
         nn.init.constant_(self.cls_head.bias, -4.6)
@@ -229,7 +243,7 @@ class HandHead(nn.Module):
         self, features: Dict[str, torch.Tensor]
     ) -> Dict[str, List[torch.Tensor]]:
         cls_out, reg_out, ctr_out = [], [], []
-        hm_out, off_out = [], []
+        hm_out, off_out, ges_out = [], [], []
 
         for lvl in self.feat_levels:
             cls_feat = self.cls_subnet(features[lvl])
@@ -244,10 +258,12 @@ class HandHead(nn.Module):
             ctr_out.append(self.ctr_head(cls_feat))
             hm_out.append(self.heatmap_head(kpt_feat))
             off_out.append(self.offset_head(kpt_feat))
+            ges_out.append(self.gesture_head(kpt_feat))  # chia sẻ kpt features
 
         return {
             'hand_cls': cls_out, 'hand_reg': reg_out, 'hand_ctr': ctr_out,
             'hand_heatmaps': hm_out, 'hand_offsets': off_out,
+            'hand_gesture': ges_out,
         }
 
 
