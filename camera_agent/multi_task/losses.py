@@ -5,14 +5,11 @@ Individual losses:
   FocalLoss      — Dense classification (handles foreground/background imbalance)
   GIoULoss       — Bounding-box regression (scale-invariant, better gradients)
   CenternessLoss — BCE for FCOS centerness prediction
-  WingLoss       — Facial landmark regression (precise for small errors)
 
 Composition:
   MultiTaskLoss  — Uncertainty-weighted combination (Kendall et al., 2018)
                    Learns per-task σ to auto-balance heterogeneous loss magnitudes
 """
-
-import math
 
 import torch
 import torch.nn as nn
@@ -161,53 +158,6 @@ class CenternessLoss(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# Wing Loss
-# ---------------------------------------------------------------------------
-
-class WingLoss(nn.Module):
-    """
-    Wing Loss (Feng et al., 2018)
-    Designed for facial landmark regression.
-
-    L(x) = w · ln(1 + |x|/ε)   if |x| < w
-           |x| − C              otherwise
-    where C = w − w · ln(1 + w/ε)
-
-    Provides stronger gradient for small-medium errors than L1/L2.
-    """
-
-    def __init__(self, w: float = 10.0, epsilon: float = 2.0,
-                 reduction: str = 'mean'):
-        super().__init__()
-        self.w = w
-        self.epsilon = epsilon
-        self.C = w - w * math.log(1 + w / epsilon)
-        self.reduction = reduction
-
-    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            pred:   Predicted landmarks [N, num_points × 2]
-            target: GT landmarks        [N, num_points × 2]
-        """
-        if pred.numel() == 0:
-            return pred.sum() * 0.0
-
-        diff = torch.abs(pred - target)
-        loss = torch.where(
-            diff < self.w,
-            self.w * torch.log1p(diff / self.epsilon),
-            diff - self.C,
-        )
-
-        if self.reduction == 'mean':
-            return loss.mean()
-        elif self.reduction == 'sum':
-            return loss.sum()
-        return loss
-
-
-# ---------------------------------------------------------------------------
 # Multi-Task Loss (Uncertainty Weighting)
 # ---------------------------------------------------------------------------
 
@@ -238,8 +188,7 @@ class MultiTaskLoss(nn.Module):
     # Default sub-task names matching the head outputs
     DEFAULT_TASKS = [
         'person_cls', 'person_reg', 'person_ctr',
-        'face_cls',   'face_reg',   'face_ctr',  'face_lmk',
-        'hand_cls',   'hand_reg',   'hand_ctr',  'hand_kpt', 'hand_hm',
+        'face_cls',   'face_reg',   'face_ctr',
     ]
 
     def __init__(self, task_names: List[str] = None):
@@ -305,12 +254,6 @@ if __name__ == '__main__':
     ctr_pred = torch.randn(2)
     print(f"CtrLoss:        {cl(ctr_pred, ctr_target).item():.4f}")
     print(f"  targets:      {ctr_target.tolist()}")
-
-    # --- Wing Loss ---
-    wl = WingLoss()
-    pred_lmk = torch.randn(5, 10)
-    gt_lmk = pred_lmk + torch.randn_like(pred_lmk) * 2
-    print(f"WingLoss:       {wl(pred_lmk, gt_lmk).item():.4f}")
 
     # --- MultiTaskLoss ---
     mt = MultiTaskLoss()

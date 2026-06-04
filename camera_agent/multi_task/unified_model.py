@@ -14,15 +14,14 @@ from .heads import MultiTaskHead
 
 class UnifiedMultiTaskModel(nn.Module):
     """
-    Multi-task model for person detection, face detection, and hand keypoint detection
+    Multi-task model for person detection and face detection
     
     Architecture:
         Input Image → SharedBackbone → FPN Features → Task Heads → Outputs
         
     Single forward pass detects:
         - People (bounding boxes)
-        - Faces (bounding boxes + landmarks)
-        - Hands (21 keypoints)
+        - Faces (bounding boxes)
     """
     
     def __init__(
@@ -58,7 +57,7 @@ class UnifiedMultiTaskModel(nn.Module):
         print(f"\n=== Unified Multi-Task Model ===")
         print(f"Backbone: {backbone_name}")
         print(f"Feature channels: {feature_channels}")
-        print(f"Tasks: Person Detection, Face Detection, Hand Keypoints")
+        print(f"Tasks: Person Detection, Face Detection")
         
         self._print_model_info()
     
@@ -91,13 +90,6 @@ class UnifiedMultiTaskModel(nn.Module):
                 - face_cls: [B, 1, H, W]
                 - face_reg: [B, 4, H, W]
                 - face_ctr: [B, 1, H, W]
-                - face_lmk: [B, 10, H, W]  landmark offsets / stride
-            Hand (levels: p3):
-                - hand_cls: [B, 1, H, W]
-                - hand_reg: [B, 4, H, W]
-                - hand_ctr: [B, 1, H, W]
-                - hand_heatmaps: [B, 21, H, W]  keypoint visibility
-                - hand_offsets:  [B, 42, H, W]  keypoint offsets / stride
         """
         # Extract shared features from backbone
         features = self.backbone(x)
@@ -113,7 +105,6 @@ class UnifiedMultiTaskModel(nn.Module):
         return {
             'person': self.heads.person_head.feat_levels,
             'face':   self.heads.face_head.feat_levels,
-            'hand':   self.heads.hand_head.feat_levels,
         }
 
     def save(self, path: str):

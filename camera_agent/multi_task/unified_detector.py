@@ -1,20 +1,30 @@
 """
 Unified Detector for Multi-Task Inference
 
-FCOS-style vectorized decode with NMS for person, face, and hand detection.
-Single forward pass → all detections.
+FCOS-style vectorized decode with NMS for person and face detection.
+Single forward pass → detections, with optional teacher recognition from face bbox.
 """
 
+import json
 import cv2
 import torch
 import numpy as np
 from torchvision.ops import nms
-from typing import Dict, List, Tuple, Optional
-from dataclasses import dataclass
+from typing import Any, Dict, List, Tuple, Optional
+from dataclasses import dataclass, field
+from pathlib import Path
 import time
 
 from .unified_model import create_unified_model
 from .heads import STRIDES
+
+try:
+    from ..old_architecture.arcface_recognizer import ArcFaceRecognizer, ArcFaceConfig
+    ARCFACE_MODULE_AVAILABLE = True
+except Exception:
+    ArcFaceRecognizer = None
+    ArcFaceConfig = None
+    ARCFACE_MODULE_AVAILABLE = False
 
 
 # ---------------------------------------------------------------------------
@@ -31,20 +41,32 @@ class PersonDetection:
 
 @dataclass
 class FaceDetection:
-    """Face detection result with landmarks"""
+    """Face detection result"""
     bbox: np.ndarray  # [x1, y1, x2, y2]
-    landmarks: np.ndarray  # [5, 2] - 5 facial landmarks (x, y)
     confidence: float
     track_id: Optional[int] = None
 
 
 @dataclass
-class HandDetection:
-    """Hand detection result with keypoints"""
-    bbox: np.ndarray  # [x1, y1, x2, y2] - bounding box around hand
-    keypoints: np.ndarray  # [21, 2] - 21 hand keypoints (x, y)
-    confidence: float
-    visibility: np.ndarray  # [21] - visibility score for each keypoint
+class CameraAgentOutput:
+    """Structured camera output for downstream control agent."""
+    num_students: int = 0
+    teacher_id: Optional[str] = None
+    teacher_confidence: Optional[float] = None
+    teacher_preferences: Dict[str, Any] = field(default_factory=dict)
+    gesture_command: Optional[str] = None
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            'num_students': self.num_students,
+            'teacher_id': self.teacher_id,
+            'teacher_confidence': self.teacher_confidence,
+            'teacher_preferences': self.teacher_preferences,
+            'gesture_command': self.gesture_command,
+        }
+
+    def to_json(self) -> str:
+        return json.dumps(self.to_dict(), ensure_ascii=False)
 
 
 # ---------------------------------------------------------------------------
@@ -53,7 +75,7 @@ class HandDetection:
 
 class UnifiedDetector:
     """
-    Unified detector: single forward pass → person + face + hand detections
+    Unified detector: single forward pass → person + face detections
 
     Uses FCOS-style decoding:
       score = sigmoid(cls) × sigmoid(centerness)
@@ -70,6 +92,10 @@ class UnifiedDetector:
         confidence_threshold: float = 0.5,
         nms_iou: float = 0.5,
         image_size: int = 640,
+        enable_teacher_recognition: bool = False,
+        teacher_db_path: Optional[str] = None,
+        teacher_preferences_path: Optional[str] = None,
+        teacher_recognition_threshold: float = 0.5,
     ):
         """
         Args:
@@ -79,11 +105,23 @@ class UnifiedDetector:
             confidence_threshold: Min score (cls × centerness) to keep
             nms_iou: IoU threshold for NMS
             image_size: Input image size (square)
+            enable_teacher_recognition: Enable ArcFace teacher recognition
+            teacher_db_path: Path to ArcFace teacher embedding DB (pkl)
+            teacher_preferences_path: Path to teacher preference DB (json/pkl)
+            teacher_recognition_threshold: Cosine threshold for recognition
         """
         self.device = device
         self.confidence_threshold = confidence_threshold
         self.nms_iou = nms_iou
         self.image_size = image_size
+        self.enable_teacher_recognition = enable_teacher_recognition
+
+        default_teacher_db = Path(__file__).resolve().parents[1] / 'teacher_database.pkl'
+        self.teacher_db_path = str(teacher_db_path or default_teacher_db)
+        self.teacher_preferences_path = teacher_preferences_path
+        self.teacher_recognition_threshold = teacher_recognition_threshold
+        self.teacher_preferences: Dict[str, Dict[str, Any]] = {}
+        self.arcface_recognizer = None
 
         print(f"Loading unified model on {device}...")
         self.model = create_unified_model(
@@ -98,8 +136,77 @@ class UnifiedDetector:
         # Get feat_levels from model for each task
         self.feat_levels = self.model.feat_levels
 
+        # Optional teacher recognition stack
+        self._init_teacher_recognition()
+
         print(f"Unified detector ready "
               f"(conf={confidence_threshold}, nms={nms_iou})")
+
+    def _init_teacher_recognition(self):
+        """Initialize optional ArcFace recognizer and teacher preference DB."""
+        self.teacher_preferences = self._load_teacher_preferences(
+            self.teacher_preferences_path,
+        )
+
+        if not self.enable_teacher_recognition:
+            return
+
+        if not ARCFACE_MODULE_AVAILABLE or ArcFaceConfig is None:
+            print('ArcFace module unavailable. Teacher recognition disabled.')
+            self.enable_teacher_recognition = False
+            return
+
+        try:
+            arcface_config = ArcFaceConfig()
+            arcface_config.recognition_threshold = self.teacher_recognition_threshold
+            arcface_config.device = self.device
+
+            recognizer = ArcFaceRecognizer(
+                config=arcface_config,
+                database_path=self.teacher_db_path,
+            )
+            if recognizer.initialize():
+                self.arcface_recognizer = recognizer
+            else:
+                print('Failed to initialize ArcFace recognizer. Teacher recognition disabled.')
+                self.enable_teacher_recognition = False
+        except Exception as exc:
+            print(f'ArcFace initialization error: {exc}. Teacher recognition disabled.')
+            self.enable_teacher_recognition = False
+
+    @staticmethod
+    def _load_teacher_preferences(path: Optional[str]) -> Dict[str, Dict[str, Any]]:
+        """Load teacher preference mapping from json/pkl if provided."""
+        if not path:
+            return {}
+
+        pref_path = Path(path)
+        if not pref_path.exists():
+            return {}
+
+        try:
+            if pref_path.suffix.lower() == '.json':
+                raw = json.loads(pref_path.read_text(encoding='utf-8'))
+            elif pref_path.suffix.lower() in {'.pkl', '.pickle'}:
+                import pickle
+                with pref_path.open('rb') as f:
+                    raw = pickle.load(f)
+            else:
+                return {}
+        except Exception:
+            return {}
+
+        if not isinstance(raw, dict):
+            return {}
+
+        normalized: Dict[str, Dict[str, Any]] = {}
+        for teacher_id, value in raw.items():
+            if isinstance(value, dict):
+                if isinstance(value.get('preferences'), dict):
+                    normalized[str(teacher_id)] = value['preferences']
+                else:
+                    normalized[str(teacher_id)] = value
+        return normalized
 
     # ------------------------------------------------------------------
     # Preprocessing
@@ -148,7 +255,7 @@ class UnifiedDetector:
         Returns None if no detections pass the threshold, otherwise:
             boxes      [N, 4]  —  xyxy in input-image pixel coords
             scores     [N]
-            grid_cx    [N]     —  grid center x (needed for landmark decode)
+            grid_cx    [N]     —  grid center x
             grid_cy    [N]
             flat_mask  [H*W]   —  boolean mask in flattened spatial grid
         """
@@ -242,11 +349,10 @@ class UnifiedDetector:
         scale: float,
         orig_shape: Tuple[int, int],
     ) -> List[FaceDetection]:
-        """Decode face detections + landmarks from FPN levels + NMS"""
+        """Decode face detections from FPN levels + NMS"""
         levels = self.feat_levels['face']
         all_boxes: List[torch.Tensor] = []
         all_scores: List[torch.Tensor] = []
-        all_lmks: List[torch.Tensor] = []
 
         for i, lvl in enumerate(levels):
             stride = STRIDES[lvl]
@@ -259,119 +365,97 @@ class UnifiedDetector:
             if result is None:
                 continue
 
-            boxes, scores, valid_cx, valid_cy, mask = result
-
-            # Decode landmarks: grid_center + (offset × stride)
-            lmk_flat = outputs['face_lmk'][i][0].reshape(10, -1)   # [10, H*W]
-            valid_lmk = lmk_flat[:, mask].reshape(5, 2, -1)        # [5, 2, N]
-
-            lmk_x = valid_cx.unsqueeze(0) + valid_lmk[:, 0, :] * stride
-            lmk_y = valid_cy.unsqueeze(0) + valid_lmk[:, 1, :] * stride
-            landmarks = torch.stack(
-                [lmk_x, lmk_y], dim=2
-            ).permute(1, 0, 2)                                     # [N, 5, 2]
+            boxes, scores, *_ = result
 
             all_boxes.append(boxes)
             all_scores.append(scores)
-            all_lmks.append(landmarks)
 
         if not all_boxes:
             return []
 
         boxes = torch.cat(all_boxes) / scale
         scores = torch.cat(all_scores)
-        lmks = torch.cat(all_lmks) / scale
 
         boxes[:, 0].clamp_(0, orig_shape[1])
         boxes[:, 1].clamp_(0, orig_shape[0])
         boxes[:, 2].clamp_(0, orig_shape[1])
         boxes[:, 3].clamp_(0, orig_shape[0])
-        lmks[:, :, 0].clamp_(0, orig_shape[1])
-        lmks[:, :, 1].clamp_(0, orig_shape[0])
 
         keep = nms(boxes, scores, self.nms_iou)
 
         return [
             FaceDetection(
                 bbox=boxes[k].cpu().numpy(),
-                landmarks=lmks[k].cpu().numpy().astype(int),
                 confidence=scores[k].item(),
             )
             for k in keep
         ]
 
-    def detect_hands(
+    def recognize_teacher(
         self,
-        outputs: Dict[str, List[torch.Tensor]],
-        scale: float,
-        orig_shape: Tuple[int, int],
-    ) -> List[HandDetection]:
-        """Decode hand detections + keypoints from FPN levels + NMS"""
-        levels = self.feat_levels['hand']
-        all_boxes: List[torch.Tensor] = []
-        all_scores: List[torch.Tensor] = []
-        all_kpts: List[torch.Tensor] = []
-        all_vis: List[torch.Tensor] = []
+        image: np.ndarray,
+        faces: List[FaceDetection],
+    ) -> Tuple[Optional[str], Optional[float], Dict[str, Any]]:
+        """Recognize teacher from detected face bboxes using ArcFace."""
+        if (
+            not self.enable_teacher_recognition
+            or self.arcface_recognizer is None
+            or not faces
+        ):
+            return None, None, {}
 
-        for i, lvl in enumerate(levels):
-            stride = STRIDES[lvl]
-            result = self._decode_fcos_level(
-                outputs['hand_cls'][i],
-                outputs['hand_reg'][i],
-                outputs['hand_ctr'][i],
-                stride,
-            )
-            if result is None:
+        h, w = image.shape[:2]
+        sorted_faces = sorted(faces, key=lambda f: f.confidence, reverse=True)
+        best_similarity: Optional[float] = None
+
+        for face in sorted_faces[:3]:
+            x1, y1, x2, y2 = [int(v) for v in face.bbox]
+            x1 = max(0, min(x1, w - 1))
+            y1 = max(0, min(y1, h - 1))
+            x2 = max(0, min(x2, w))
+            y2 = max(0, min(y2, h))
+
+            if x2 <= x1 or y2 <= y1:
                 continue
 
-            boxes, scores, valid_cx, valid_cy, mask = result
-
-            # Decode keypoint offsets: grid_center + (offset × stride)
-            off_flat = outputs['hand_offsets'][i][0].reshape(42, -1)
-            hm_flat = outputs['hand_heatmaps'][i][0].reshape(21, -1)
-
-            valid_off = off_flat[:, mask].reshape(21, 2, -1)   # [21, 2, N]
-            valid_hm = hm_flat[:, mask]                        # [21, N]
-
-            kpt_x = valid_cx.unsqueeze(0) + valid_off[:, 0, :] * stride
-            kpt_y = valid_cy.unsqueeze(0) + valid_off[:, 1, :] * stride
-            keypoints = torch.stack(
-                [kpt_x, kpt_y], dim=2
-            ).permute(1, 0, 2)                                 # [N, 21, 2]
-
-            visibility = torch.sigmoid(valid_hm).permute(1, 0) # [N, 21]
-
-            all_boxes.append(boxes)
-            all_scores.append(scores)
-            all_kpts.append(keypoints)
-            all_vis.append(visibility)
-
-        if not all_boxes:
-            return []
-
-        boxes = torch.cat(all_boxes) / scale
-        scores = torch.cat(all_scores)
-        kpts = torch.cat(all_kpts) / scale
-        vis = torch.cat(all_vis)
-
-        boxes[:, 0].clamp_(0, orig_shape[1])
-        boxes[:, 1].clamp_(0, orig_shape[0])
-        boxes[:, 2].clamp_(0, orig_shape[1])
-        boxes[:, 3].clamp_(0, orig_shape[0])
-        kpts[:, :, 0].clamp_(0, orig_shape[1])
-        kpts[:, :, 1].clamp_(0, orig_shape[0])
-
-        keep = nms(boxes, scores, self.nms_iou)
-
-        return [
-            HandDetection(
-                bbox=boxes[k].cpu().numpy(),
-                keypoints=kpts[k].cpu().numpy().astype(int),
-                confidence=scores[k].item(),
-                visibility=vis[k].cpu().numpy(),
+            arc_faces = self.arcface_recognizer.detect_and_extract(
+                image,
+                roi=(x1, y1, x2, y2),
             )
-            for k in keep
-        ]
+            if not arc_faces:
+                continue
+
+            for arc_face in arc_faces:
+                teacher_id, similarity = self.arcface_recognizer.recognize_face(
+                    arc_face['embedding'],
+                )
+                if best_similarity is None or similarity > best_similarity:
+                    best_similarity = similarity
+
+                if teacher_id is not None:
+                    preferences = self.teacher_preferences.get(teacher_id, {})
+                    return teacher_id, float(similarity), preferences
+
+        return None, best_similarity, {}
+
+    def build_camera_output(
+        self,
+        image: np.ndarray,
+        people: List[PersonDetection],
+        faces: List[FaceDetection],
+    ) -> CameraAgentOutput:
+        """Build downstream JSON-compatible camera output."""
+        teacher_id, teacher_confidence, preferences = self.recognize_teacher(
+            image,
+            faces,
+        )
+        return CameraAgentOutput(
+            num_students=len(people),
+            teacher_id=teacher_id,
+            teacher_confidence=teacher_confidence,
+            teacher_preferences=preferences,
+            gesture_command=None,
+        )
 
     # ------------------------------------------------------------------
     # Main entry point
@@ -380,8 +464,7 @@ class UnifiedDetector:
     @torch.no_grad()
     def detect(
         self, image: np.ndarray,
-    ) -> Tuple[List[PersonDetection], List[FaceDetection],
-               List[HandDetection], float]:
+    ) -> Tuple[List[PersonDetection], List[FaceDetection], float]:
         """
         Unified detection on single image
         
@@ -389,7 +472,7 @@ class UnifiedDetector:
             image: BGR image [H, W, 3]
             
         Returns:
-            (people, faces, hands, inference_time_ms)
+            (people, faces, inference_time_ms)
         """
         start = time.time()
         
@@ -402,10 +485,19 @@ class UnifiedDetector:
         # Post-process each task
         people = self.detect_people(outputs, scale, orig_shape)
         faces = self.detect_faces(outputs, scale, orig_shape)
-        hands = self.detect_hands(outputs, scale, orig_shape)
 
         inference_time = (time.time() - start) * 1000
-        return people, faces, hands, inference_time
+        return people, faces, inference_time
+
+    @torch.no_grad()
+    def detect_with_output(
+        self,
+        image: np.ndarray,
+    ) -> Tuple[List[PersonDetection], List[FaceDetection], CameraAgentOutput, float]:
+        """Run detection and return camera output for control-agent integration."""
+        people, faces, inference_time = self.detect(image)
+        camera_output = self.build_camera_output(image, people, faces)
+        return people, faces, camera_output, inference_time
 
 
 # ---------------------------------------------------------------------------
@@ -424,19 +516,22 @@ if __name__ == '__main__':
     
     # Create test image
     test_image = np.random.randint(0, 255, (480, 640, 3), dtype=np.uint8)
-    people, faces, hands, t = detector.detect(test_image)
+    people, faces, t = detector.detect(test_image)
 
     print(f"Results:")
     print(f"  People: {len(people)}")
     print(f"  Faces:  {len(faces)}")
-    print(f"  Hands:  {len(hands)}")
     print(f"  Time:   {t:.2f} ms")
 
     print("\nBenchmarking (50 iterations)...")
     times = []
     for _ in range(50):
-        _, _, _, t = detector.detect(test_image)
+        _, _, t = detector.detect(test_image)
         times.append(t)
 
     print(f"Average: {np.mean(times):.2f} ms")
     print(f"FPS: {1000 / np.mean(times):.1f}")
+
+    _, _, cam_out, _ = detector.detect_with_output(test_image)
+    print("\nCamera output:")
+    print(cam_out.to_json())

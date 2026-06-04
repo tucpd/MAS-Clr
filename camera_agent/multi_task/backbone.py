@@ -13,7 +13,7 @@ class SharedBackbone(nn.Module):
     """
     Shared feature extractor for multi-task detection
     
-    Extracts features that will be used by PersonHead, FaceHead, and HandHead
+    Extracts features that will be used by PersonHead and FaceHead
     """
     
     def __init__(

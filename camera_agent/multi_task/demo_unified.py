@@ -1,6 +1,6 @@
 """
 Demo script for Unified Multi-Task Detector
-Shows person detection, face detection with landmarks, and hand keypoint detection
+Shows person detection and face detection
 All in a single forward pass!
 """
 
@@ -8,7 +8,7 @@ import cv2
 import numpy as np
 import time
 import logging
-from pathlib import Path
+from typing import Optional
 
 from unified_detector import UnifiedDetector
 
@@ -36,14 +36,9 @@ def draw_person(image: np.ndarray, person, color=(0, 255, 0)):
 
 
 def draw_face(image: np.ndarray, face, color=(255, 0, 0)):
-    """Draw face bounding box and landmarks"""
+    """Draw face bounding box"""
     x1, y1, x2, y2 = face.bbox
     cv2.rectangle(image, (x1, y1), (x2, y2), color, 2)
-    
-    # Draw landmarks
-    if face.landmarks is not None:
-        for (lx, ly) in face.landmarks:
-            cv2.circle(image, (int(lx), int(ly)), 2, (0, 255, 255), -1)
     
     # Draw label
     label = f"Face {face.confidence:.2f}"
@@ -55,64 +50,29 @@ def draw_face(image: np.ndarray, face, color=(255, 0, 0)):
     cv2.putText(image, label, (x1, y1 - 2), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
 
 
-def draw_hand(image: np.ndarray, hand, color=(0, 0, 255)):
-    """Draw hand bounding box and keypoints"""
-    x1, y1, x2, y2 = hand.bbox
-    cv2.rectangle(image, (x1, y1), (x2, y2), color, 2)
-    
-    # Draw keypoints
-    if hand.keypoints is not None:
-        # Hand connections (MediaPipe hand model)
-        connections = [
-            # Thumb
-            (0, 1), (1, 2), (2, 3), (3, 4),
-            # Index finger
-            (0, 5), (5, 6), (6, 7), (7, 8),
-            # Middle finger
-            (0, 9), (9, 10), (10, 11), (11, 12),
-            # Ring finger
-            (0, 13), (13, 14), (14, 15), (15, 16),
-            # Pinky
-            (0, 17), (17, 18), (18, 19), (19, 20)
-        ]
-        
-        # Draw connections
-        for connection in connections:
-            start_idx, end_idx = connection
-            if start_idx < len(hand.keypoints) and end_idx < len(hand.keypoints):
-                start_point = tuple(hand.keypoints[start_idx].astype(int))
-                end_point = tuple(hand.keypoints[end_idx].astype(int))
-                cv2.line(image, start_point, end_point, (255, 100, 0), 1)
-        
-        # Draw keypoints
-        for i, (kx, ky) in enumerate(hand.keypoints):
-            visibility = hand.visibility[i] if hand.visibility is not None else 1.0
-            color_intensity = int(255 * visibility)
-            cv2.circle(image, (int(kx), int(ky)), 3, (0, color_intensity, 255), -1)
-    
-    # Draw label
-    label = f"Hand {hand.confidence:.2f}"
-    (text_w, text_h), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
-    cv2.rectangle(image, (x1, y2), (x1 + text_w, y2 + text_h + 4), color, -1)
-    cv2.putText(image, label, (x1, y2 + text_h + 2), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-
-
-def draw_stats(image: np.ndarray, people_count: int, faces_count: int, hands_count: int, 
-               inference_time: float, fps: float):
+def draw_stats(image: np.ndarray, people_count: int, faces_count: int,
+               inference_time: float, fps: float,
+               teacher_id: Optional[str] = None,
+               teacher_confidence: Optional[float] = None):
     """Draw statistics overlay"""
-    h, w = image.shape[:2]
-    
     # Create semi-transparent overlay
     overlay = image.copy()
-    cv2.rectangle(overlay, (10, 10), (300, 150), (0, 0, 0), -1)
+    cv2.rectangle(overlay, (10, 10), (360, 165), (0, 0, 0), -1)
     cv2.addWeighted(overlay, 0.7, image, 0.3, 0, image)
     
     # Draw stats
     y_offset = 35
+    teacher_text = 'Teacher: unknown'
+    if teacher_id is not None:
+        if teacher_confidence is not None:
+            teacher_text = f"Teacher: {teacher_id} ({teacher_confidence:.2f})"
+        else:
+            teacher_text = f"Teacher: {teacher_id}"
+
     stats = [
         f"People: {people_count}",
         f"Faces: {faces_count}",
-        f"Hands: {hands_count}",
+        teacher_text,
         f"Inference: {inference_time:.1f} ms",
         f"FPS: {fps:.1f}"
     ]
@@ -127,7 +87,10 @@ def process_and_display_video(
     source: str = '0',
     output_path: str = None,
     display: bool = True,
-    confidence_threshold: float = 0.5
+    confidence_threshold: float = 0.5,
+    enable_teacher_recognition: bool = False,
+    teacher_db_path: Optional[str] = None,
+    teacher_preferences_path: Optional[str] = None,
 ):
     """
     Process video with unified detector
@@ -143,7 +106,10 @@ def process_and_display_video(
     detector = UnifiedDetector(
         backbone_name='mobilenetv3_large_100',
         confidence_threshold=confidence_threshold,
-        image_size=640
+        image_size=640,
+        enable_teacher_recognition=enable_teacher_recognition,
+        teacher_db_path=teacher_db_path,
+        teacher_preferences_path=teacher_preferences_path,
     )
     
     # Open video source
@@ -186,7 +152,14 @@ def process_and_display_video(
             start_time = time.time()
             
             # Run unified detection
-            people, faces, hands, inference_time = detector.detect(frame)
+            if enable_teacher_recognition:
+                people, faces, camera_output, inference_time = detector.detect_with_output(frame)
+                teacher_id = camera_output.teacher_id
+                teacher_confidence = camera_output.teacher_confidence
+            else:
+                people, faces, inference_time = detector.detect(frame)
+                teacher_id = None
+                teacher_confidence = None
             
             # Draw all detections
             vis_frame = frame.copy()
@@ -197,9 +170,6 @@ def process_and_display_video(
             for face in faces:
                 draw_face(vis_frame, face, color=(255, 0, 0))
             
-            for hand in hands:
-                draw_hand(vis_frame, hand, color=(0, 0, 255))
-            
             # Calculate FPS
             frame_time = time.time() - start_time
             frame_times.append(frame_time)
@@ -208,8 +178,10 @@ def process_and_display_video(
             avg_fps = 1.0 / (sum(frame_times) / len(frame_times))
             
             # Draw stats
-            draw_stats(vis_frame, len(people), len(faces), len(hands), 
-                      inference_time, avg_fps)
+            draw_stats(vis_frame, len(people), len(faces),
+                      inference_time, avg_fps,
+                      teacher_id=teacher_id,
+                      teacher_confidence=teacher_confidence)
             
             # Write to output
             if writer:
@@ -231,7 +203,7 @@ def process_and_display_video(
             # Log progress
             if frame_count % 30 == 0:
                 logger.info(f"Frame {frame_count}: {len(people)} people, "
-                          f"{len(faces)} faces, {len(hands)} hands | "
+                          f"{len(faces)} faces, teacher={teacher_id} | "
                           f"{inference_time:.1f}ms | {avg_fps:.1f} FPS")
     
     except KeyboardInterrupt:
@@ -264,6 +236,12 @@ def main():
                        help='Disable display window')
     parser.add_argument('--conf-threshold', type=float, default=0.5,
                        help='Detection confidence threshold')
+    parser.add_argument('--enable-teacher-recognition', action='store_true',
+                       help='Enable ArcFace-based teacher recognition from face bboxes')
+    parser.add_argument('--teacher-db', type=str, default=None,
+                       help='Path to ArcFace teacher embedding DB (pkl)')
+    parser.add_argument('--teacher-preferences', type=str, default=None,
+                       help='Path to teacher preferences DB (json/pkl)')
     
     args = parser.parse_args()
     
@@ -272,12 +250,16 @@ def main():
     logger.info("=" * 60)
     logger.info(f"Source: {args.source}")
     logger.info(f"Confidence threshold: {args.conf_threshold}")
+    logger.info(f"Teacher recognition: {'on' if args.enable_teacher_recognition else 'off'}")
     
     process_and_display_video(
         source=args.source,
         output_path=args.output,
         display=not args.no_display,
-        confidence_threshold=args.conf_threshold
+        confidence_threshold=args.conf_threshold,
+        enable_teacher_recognition=args.enable_teacher_recognition,
+        teacher_db_path=args.teacher_db,
+        teacher_preferences_path=args.teacher_preferences,
     )
 
 

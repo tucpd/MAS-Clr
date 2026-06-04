@@ -1,0 +1,12 @@
+{
+  "teacher_001": {
+    "ac_temp": 24,
+    "fan_speed": "med",
+    "light_brightness": "high"
+  },
+  "teacher_002": {
+    "ac_temp": 25,
+    "fan_speed": "low",
+    "light_brightness": "normal"
+  }
+}
